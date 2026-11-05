@@ -1,0 +1,253 @@
+# Builds pullable Docker test images for YOUR open pull requests on upstream MeshCentral.
+#
+# Every image is "latest upstream master + PR(s)". The PR code is merged onto the current
+# upstream master, so testers get today's master plus your change and nobody else's PRs.
+#
+#   ghcr.io/<owner>/meshcentral:pr-<number>   one image per open PR of yours
+#   ghcr.io/<owner>/meshcentral:my-prs        all your open PRs merged together
+#                                              (a PR that conflicts with the others is left out
+#                                              and listed in the run summary)
+#
+# Each build also gets a fixed tag like pr-8301-20261105-2123 that never moves.
+#
+# It runs every hour and only rebuilds an image when upstream master or the PR has new commits.
+# Use "Run workflow" on the Actions tab to build right away (optionally one PR, or forced).
+# PR author defaults to the owner of this repo; set the PR_AUTHOR repository variable to change it.
+
+name: PR test images
+
+on:
+  schedule:
+    - cron: '23 * * * *' # hourly
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Only build this upstream PR number (leave blank for all of your open PRs)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if the image is already up to date'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: pr-test-images
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Ylianst/MeshCentral
+  UPSTREAM_BRANCH: master
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  plan:
+    name: Find PRs to build
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      image: ${{ steps.plan.outputs.image }}
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List open PRs and skip images that are already up to date
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_AUTHOR: ${{ vars.PR_AUTHOR || github.repository_owner }}
+          ONLY_PR: ${{ inputs.pr }}
+          FORCE: ${{ inputs.force }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${OWNER,,}/meshcentral"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+          base=$(gh api "repos/$UPSTREAM_REPO/commits/$UPSTREAM_BRANCH" --jq .sha)
+          echo "Upstream $UPSTREAM_REPO@$UPSTREAM_BRANCH is at $base"
+
+          prs=$(gh pr list --repo "$UPSTREAM_REPO" --author "$PR_AUTHOR" --state open --limit 100 \
+                  --json number,title,headRefOid,url | jq -c 'sort_by(.number)')
+          if [ -n "$ONLY_PR" ]; then
+            prs=$(jq -c --argjson n "$ONLY_PR" '[.[] | select(.number == $n)]' <<<"$prs")
+            if [ "$(jq length <<<"$prs")" != 1 ]; then
+              echo "::error::#$ONLY_PR is not an open PR by $PR_AUTHOR in $UPSTREAM_REPO"
+              exit 1
+            fi
+          fi
+          echo "Open PRs by $PR_AUTHOR:"; jq -r '.[] | "  #\(.number) \(.title)"' <<<"$prs"
+
+          # One image per PR, plus a combined image when there are two or more.
+          # "key" captures exactly what went into an image; it is stored as an image label.
+          candidates=$(jq -c --arg base "$base" '[.[] | {
+              tag: "pr-\(.number)", prs: "\(.number)", title: .title,
+              base: $base, key: "\($base)+\(.headRefOid)" }]' <<<"$prs")
+          if [ -z "$ONLY_PR" ] && [ "$(jq length <<<"$prs")" -ge 2 ]; then
+            candidates=$(jq -c --arg base "$base" --argjson p "$prs" '. + [{
+                tag: "my-prs", prs: ([$p[].number | tostring] | join(" ")),
+                title: "All open PRs combined", base: $base,
+                key: ([$base] + [$p[].headRefOid] | join("+")) }]' <<<"$candidates")
+          fi
+
+          matrix='[]'
+          while read -r c; do
+            [ -n "$c" ] || continue
+            tag=$(jq -r .tag <<<"$c"); key=$(jq -r .key <<<"$c")
+            current=$(docker buildx imagetools inspect "$image:$tag" --format '{{json .Image}}' 2>/dev/null \
+                        | jq -r '(if has("config") then . else (to_entries[0].value) end)
+                                 | .config.Labels["io.github.pr-test-images.key"] // ""' 2>/dev/null || true)
+            if [ "$FORCE" != "true" ] && [ "$current" = "$key" ]; then
+              echo "$tag: up to date, skipping"
+            else
+              echo "$tag: needs a build"
+              matrix=$(jq -c --argjson c "$c" '. + [$c]' <<<"$matrix")
+            fi
+          done < <(jq -c '.[]' <<<"$candidates")
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq length <<<"$matrix")" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.tag }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Merge PR(s) onto latest upstream master
+        id: src
+        env:
+          PRS: ${{ matrix.prs }}
+          BASE: ${{ matrix.base }}
+        run: |
+          set -euo pipefail
+          git init -q src && cd src
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          refspecs=()
+          for n in $PRS; do refspecs+=("+refs/pull/$n/head:refs/remotes/pr/$n"); done
+          git fetch -q --filter=blob:none upstream "$BASE" "${refspecs[@]}"
+          git checkout -q --detach "$BASE"
+
+          included=(); skipped=()
+          for n in $PRS; do
+            if git merge -q --no-ff --no-edit -m "Merge upstream PR #$n" "pr/$n"; then
+              included+=("$n")
+            else
+              git merge --abort
+              skipped+=("$n")
+              echo "::warning::PR #$n does not merge cleanly onto upstream $UPSTREAM_BRANCH (or with the PRs before it); left out of ${{ matrix.tag }}"
+            fi
+          done
+          if [ ${#included[@]} -eq 0 ]; then
+            echo "::error::Nothing to build: PR #$PRS no longer merges cleanly onto upstream $UPSTREAM_BRANCH. Rebase or merge master into the PR branch."
+            exit 1
+          fi
+          git log --oneline -n $(( ${#included[@]} * 2 + 1 ))
+
+          echo "included=${included[*]}" >> "$GITHUB_OUTPUT"
+          echo "skipped=${skipped[*]:-}" >> "$GITHUB_OUTPUT"
+          echo "stamp=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+          echo "heads=$(for n in "${included[@]}"; do printf '#%s@%s ' "$n" "$(git rev-parse --short pr/$n)"; done)" >> "$GITHUB_OUTPUT"
+
+      # Same preparation the official image builds do before running the Dockerfile.
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+      - name: Extract, minify and translate
+        working-directory: src/translate
+        run: |
+          node translate.js || true
+          node translate extractall
+          node translate.js minifyall
+          node translate.js translateall
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: ${{ env.PLATFORMS }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ needs.plan.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ matrix.tag }}
+            type=raw,value=${{ matrix.tag }}-${{ steps.src.outputs.stamp }}
+          labels: |
+            org.opencontainers.image.title=MeshCentral test build ${{ matrix.tag }}
+            org.opencontainers.image.description=Unofficial test image: ${{ env.UPSTREAM_REPO }} ${{ env.UPSTREAM_BRANCH }} + PR(s) ${{ steps.src.outputs.heads }}
+            org.opencontainers.image.revision=${{ matrix.base }}
+            io.github.pr-test-images.key=${{ matrix.key }}
+            io.github.pr-test-images.upstream=${{ env.UPSTREAM_REPO }}@${{ matrix.base }}
+            io.github.pr-test-images.prs=${{ steps.src.outputs.heads }}
+            io.github.pr-test-images.skipped=${{ steps.src.outputs.skipped }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: src
+          file: src/docker/Dockerfile
+          push: true
+          platforms: ${{ env.PLATFORMS }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DISABLE_MINIFY=yes
+            DISABLE_TRANSLATE=yes
+            DISABLE_EXTRACT=yes
+
+      - name: Summary
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          TAG: ${{ matrix.tag }}
+          STAMP: ${{ steps.src.outputs.stamp }}
+          INCLUDED: ${{ steps.src.outputs.included }}
+          SKIPPED: ${{ steps.src.outputs.skipped }}
+          BASE: ${{ matrix.base }}
+        run: |
+          {
+            echo "## \`$IMAGE:$TAG\`"
+            echo
+            echo "Upstream \`$UPSTREAM_BRANCH\` at [\`${BASE:0:7}\`](https://github.com/$UPSTREAM_REPO/commit/$BASE) plus:"
+            for n in $INCLUDED; do echo "- https://github.com/$UPSTREAM_REPO/pull/$n"; done
+            if [ -n "$SKIPPED" ]; then
+              echo
+              echo "**Left out (merge conflict):**"
+              for n in $SKIPPED; do echo "- https://github.com/$UPSTREAM_REPO/pull/$n"; done
+            fi
+            echo
+            echo "To test it:"
+            echo '```'
+            echo "docker pull $IMAGE:$TAG"
+            echo '```'
+            echo "Or in compose.yaml: \`image: $IMAGE:$TAG\`"
+            echo
+            echo "This exact build never changes under the tag \`$TAG-$STAMP\`."
+          } >> "$GITHUB_STEP_SUMMARY"
