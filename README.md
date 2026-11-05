@@ -22,5 +22,6 @@ or in `compose.yaml`, replace the image line with `image: ghcr.io/samschultzpons
 not official releases.
 
 Images rebuild automatically (checked hourly) when upstream master or the PR gets new commits.
+Fixed build tags are kept for 30 days; all tags of merged/closed PRs are removed (cleanup runs daily).
 To build right away: Actions → *PR test images* → *Run workflow*.
 See [the workflow](.github/workflows/pr-test-images.yml) for exactly how they are built.

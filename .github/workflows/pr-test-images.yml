@@ -251,3 +251,91 @@ jobs:
             echo
             echo "This exact build never changes under the tag \`$TAG-$STAMP\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Once a day (and on every manual run) delete:
+  #   - every tag of a PR that is no longer open (merged or closed)
+  #   - fixed build tags (pr-123-20261105-2134) older than RETENTION_DAYS
+  #   - untagged leftovers (the per-architecture parts of deleted images)
+  # The moving tags (pr-123 for open PRs, my-prs) are always kept, as is any tag this
+  # workflow did not create. Needs the package's "Manage Actions access" to give this
+  # repository the Admin role.
+  cleanup:
+    name: Clean up old images
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      RETENTION_DAYS: 30
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete images of closed PRs and builds older than ${{ env.RETENTION_DAYS }} days
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_AUTHOR: ${{ vars.PR_AUTHOR || github.repository_owner }}
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ needs.plan.outputs.image }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = schedule ] && [ "$(date -u +%H)" != "03" ]; then
+            echo "Scheduled cleanup only runs once a day (03:xx UTC); manual runs always clean up."
+            exit 0
+          fi
+          api="users/${OWNER,,}/packages/container/meshcentral/versions"
+
+          open=$(gh pr list --repo "$UPSTREAM_REPO" --author "$PR_AUTHOR" --state open --limit 100 \
+                   --json number --jq '[.[].number]')
+          versions=$(gh api --paginate "$api?per_page=100" \
+                       --jq '.[] | {id, digest: .name, created_at, tags: .metadata.container.tags}' | jq -s .)
+          cutoff=$(date -u -d "-$RETENTION_DAYS days" +%Y-%m-%dT%H:%M:%SZ)
+          untagged_cutoff=$(date -u -d "-1 day" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Open PRs: $open. Package has $(jq length <<<"$versions") versions. Deleting builds from before $cutoff."
+
+          # Decide what to do with every tagged version.
+          decisions=$(jq -c --argjson open "$open" --arg cutoff "$cutoff" '
+            def ours:   test("^(pr-[0-9]+|my-prs)(-[0-9]{8}-[0-9]{4})?$");
+            def moving: test("^(pr-[0-9]+|my-prs)$");
+            def closed: (capture("^pr-(?<n>[0-9]+)") | .n | tonumber) as $n | ($open | any(. == $n)) | not;
+            [ .[] | select(.tags | length > 0) | . + { action: (
+                if   any(.tags[]; ours | not)                            then "keep"
+                elif any(.tags[]; startswith("pr-") and closed)          then "delete: PR closed"
+                elif any(.tags[]; moving)                                then "keep"
+                elif .created_at < $cutoff                               then "delete: older than retention"
+                else "keep" end) } ]' <<<"$versions")
+
+          # Everything a kept image refers to (per-architecture images, attestations) must stay.
+          keep_digests=$(jq -r '.[] | select(.action == "keep") | .digest' <<<"$decisions")
+          referenced=$(for d in $keep_digests; do
+                         echo "$d"
+                         docker buildx imagetools inspect --raw "$IMAGE@$d" | jq -r '.manifests[]?.digest'
+                       done | sort -u | jq -R . | jq -sc .)
+
+          to_delete=$(jq -c --argjson decisions "$decisions" --argjson referenced "$referenced" \
+                         --arg ucut "$untagged_cutoff" '
+            [ ($decisions[] | select(.action != "keep")),
+              (.[] | select((.tags | length) == 0 and .created_at < $ucut
+                            and (.digest as $d | $referenced | any(.[]; . == $d) | not))
+                   | . + {action: "delete: untagged leftover"}) ]' <<<"$versions")
+
+          echo "Keeping $(jq '[.[] | select(.action == "keep")] | length' <<<"$decisions") tagged versions; deleting $(jq length <<<"$to_delete")."
+          deleted=0
+          while read -r v; do
+            [ -n "$v" ] || continue
+            id=$(jq -r .id <<<"$v")
+            echo "$(jq -r '.action' <<<"$v"): $(jq -r 'if (.tags | length) > 0 then (.tags | join(", ")) else .digest end' <<<"$v")"
+            if ! out=$(gh api -X DELETE "$api/$id" 2>&1); then
+              echo "$out"
+              if grep -qiE '403|permission|forbidden' <<<"$out"; then
+                echo "::error::No permission to delete images. Open the meshcentral package settings on GitHub → Manage Actions access → add the ${{ github.repository }} repository with the Admin role."
+              fi
+              exit 1
+            fi
+            deleted=$((deleted + 1))
+          done < <(jq -c '.[]' <<<"$to_delete")
+          echo "### Cleanup: deleted $deleted image versions" >> "$GITHUB_STEP_SUMMARY"
