@@ -141,8 +141,19 @@ jobs:
           git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
           refspecs=()
           for n in $PRS; do refspecs+=("+refs/pull/$n/head:refs/remotes/pr/$n"); done
-          git fetch -q --filter=blob:none upstream "$BASE" "${refspecs[@]}"
+          # Shallow but complete fetch. (A blob:none partial clone made merges fetch files lazily,
+          # which GitHub sometimes refuses with "not our ref".)
+          git fetch -q --depth=300 upstream "$BASE" "${refspecs[@]}"
           git checkout -q --detach "$BASE"
+          for n in $PRS; do
+            tries=0
+            until git merge-base HEAD "pr/$n" >/dev/null 2>&1; do
+              tries=$((tries + 1))
+              if [ $tries -gt 5 ]; then echo "::error::No shared history found for PR #$n"; exit 1; fi
+              echo "PR #$n branched off long ago; fetching more history"
+              git fetch -q --deepen=500 upstream "$BASE" "${refspecs[@]}"
+            done
+          done
 
           included=(); skipped=()
           for n in $PRS; do
