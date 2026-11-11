@@ -67,6 +67,7 @@ jobs:
           ONLY_PR: ${{ inputs.pr }}
           FORCE: ${{ inputs.force }}
           OWNER: ${{ github.repository_owner }}
+          BUILDER_SHA: ${{ github.sha }} # my-prs also depends on the saved resolutions in this repo
         run: |
           set -euo pipefail
           image="ghcr.io/${OWNER,,}/meshcentral"
@@ -92,10 +93,10 @@ jobs:
               tag: "pr-\(.number)", prs: "\(.number)", title: .title,
               base: $base, key: "\($base)+\(.headRefOid)" }]' <<<"$prs")
           if [ -z "$ONLY_PR" ] && [ "$(jq length <<<"$prs")" -ge 2 ]; then
-            candidates=$(jq -c --arg base "$base" --argjson p "$prs" '. + [{
+            candidates=$(jq -c --arg base "$base" --argjson p "$prs" --arg builder "$BUILDER_SHA" '. + [{
                 tag: "my-prs", prs: ([$p[].number | tostring] | join(" ")),
                 title: "All open PRs combined", base: $base,
-                key: ([$base] + [$p[].headRefOid] | join("+")) }]' <<<"$candidates")
+                key: ([$base] + [$p[].headRefOid] + [$builder] | join("+")) }]' <<<"$candidates")
           fi
 
           matrix='[]'
@@ -128,6 +129,12 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
+      - name: Get saved conflict resolutions
+        uses: actions/checkout@v5
+        with:
+          path: builder
+          sparse-checkout: rerere
+
       - name: Merge PR(s) onto latest upstream master
         id: src
         env:
@@ -145,6 +152,14 @@ jobs:
           # which GitHub sometimes refuses with "not our ref".)
           git fetch -q --depth=300 upstream "$BASE" "${refspecs[@]}"
           git checkout -q --detach "$BASE"
+
+          # Saved resolutions for places where two of the PRs change the same lines (see rerere/ and
+          # the README). Git re-applies one only when it meets exactly the same conflict again.
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+          mkdir -p .git/rr-cache
+          if [ -d ../builder/rerere ]; then cp -r ../builder/rerere/. .git/rr-cache/; fi
+
           for n in $PRS; do
             tries=0
             until git merge-base HEAD "pr/$n" >/dev/null 2>&1; do
@@ -155,14 +170,33 @@ jobs:
             done
           done
 
+          # After a conflicted merge: true only if saved resolutions fixed every file, no conflict
+          # markers are left, and every changed JavaScript/JSON file still parses.
+          resolved_ok() {
+            [ -z "$(git diff --name-only --diff-filter=U)" ] || return 1
+            ! git diff --cached | grep -qE '^\+(<<<<<<<|>>>>>>>) ' || return 1
+            local f
+            for f in $(git diff --cached --name-only --diff-filter=AM); do
+              case "$f" in
+                *.js)   node --check "$f" >/dev/null 2>&1 || { echo "Saved resolution broke $f"; return 1; } ;;
+                *.json) python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$f" 2>/dev/null || { echo "Saved resolution broke $f"; return 1; } ;;
+              esac
+            done
+          }
+
           included=(); skipped=()
           for n in $PRS; do
             if git merge -q --no-ff --no-edit -m "Merge upstream PR #$n" "pr/$n"; then
               included+=("$n")
+            elif resolved_ok; then
+              git commit -q --no-edit
+              included+=("$n")
+              echo "PR #$n overlaps the PRs before it; applied the saved resolution"
             else
+              echo "Unresolved: $(git diff --name-only --diff-filter=U | tr '\n' ' ')"
               git merge --abort
               skipped+=("$n")
-              echo "::warning::PR #$n does not merge cleanly onto upstream $UPSTREAM_BRANCH (or with the PRs before it); left out of ${{ matrix.tag }}"
+              echo "::warning::PR #$n does not merge cleanly onto upstream $UPSTREAM_BRANCH (or with the PRs before it) and there is no saved resolution for it; left out of ${{ matrix.tag }}"
             fi
           done
           if [ ${#included[@]} -eq 0 ]; then
